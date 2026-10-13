@@ -1,403 +1,1488 @@
 "use strict";
 
-const $ = id => document.getElementById(id);
+/*
+ * Private Gallery
+ * Local encrypted photo and video vault.
+ *
+ * IMPORTANT:
+ * Browser-only security has limitations.
+ * This application does not guarantee protection
+ * against a compromised device or modified JavaScript.
+ */
 
-const META = "private_gallery_meta_v1";
-const DB = "private_gallery_db_v1";
-const STORE = "photos";
+const $ = (id) => document.getElementById(id);
+
+const META_KEY = "private_gallery_meta_v2";
+const DB_NAME = "private_gallery_db_v2";
+const STORE_NAME = "photos";
 
 const ITERATIONS = 600000;
-const LOCK_MS = 60000;
+const LOCK_MS = 60_000;
 const MAX_FAILURES = 10;
+const LOCK_EVERY = 3;
+const IDLE_MS = 60_000;
 
 let vaultKey = null;
 let firstPassword = null;
+
 let selected = new Set();
-let failures1 = 0;
-let failures2 = 0;
-let lockUntil = 0;
-let idleTimer = null;
-let recoveryCode = null;
 let urls = [];
 
-function show(id) {
-  ["setup","recoveryShow","step1","step2",
-   "recovery","gallery"].forEach(name => {
-    $(name).classList.toggle("hidden", name !== id);
-  });
+let failureCounts = {
+    step1: 0,
+    step2: 0
+};
+
+let lockUntil = {
+    step1: 0,
+    step2: 0
+};
+
+let idleTimer = null;
+let countdownTimer = null;
+let busy = false;
+
+
+/* =====================================================
+   BASIC UTILITIES
+===================================================== */
+
+function setStatus(id, message) {
+    const element = $(id);
+
+    if (element) {
+        element.textContent = message;
+    }
 }
 
-function randomBytes(n) {
-  return crypto.getRandomValues(new Uint8Array(n));
+function showScreen(id) {
+    const screens = [
+        "setup",
+        "recoveryShow",
+        "step1",
+        "step2",
+        "recovery",
+        "gallery"
+    ];
+
+    for (const name of screens) {
+        const element = $(name);
+
+        if (element) {
+            element.classList.toggle("hidden", name !== id);
+        }
+    }
+
+    if (id !== "gallery") {
+        stopIdleTimer();
+    }
+}
+
+function randomBytes(length) {
+    if (!crypto || !crypto.getRandomValues) {
+        throw new Error("Secure random number generation is unavailable.");
+    }
+
+    return crypto.getRandomValues(new Uint8Array(length));
 }
 
 function toBase64(bytes) {
-  let s = "";
-  bytes.forEach(b => s += String.fromCharCode(b));
-  return btoa(s);
+    let binary = "";
+
+    for (const byte of bytes) {
+        binary += String.fromCharCode(byte);
+    }
+
+    return btoa(binary);
 }
 
-function fromBase64(s) {
-  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+function fromBase64(value) {
+    return Uint8Array.from(
+        atob(value),
+        character => character.charCodeAt(0)
+    );
 }
 
-function encode(s) {
-  return new TextEncoder().encode(s);
+function encode(value) {
+    return new TextEncoder().encode(value);
 }
 
-function metaGet() {
-  try {
-    return JSON.parse(localStorage.getItem(META));
-  } catch {
-    return null;
-  }
+function equalStrings(a, b) {
+    if (typeof a !== "string" || typeof b !== "string") {
+        return false;
+    }
+
+    if (a.length !== b.length) {
+        return false;
+    }
+
+    let difference = 0;
+
+    for (let i = 0; i < a.length; i++) {
+        difference |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+
+    return difference === 0;
 }
 
-function metaSave(m) {
-  localStorage.setItem(META, JSON.stringify(m));
+function getMeta() {
+    try {
+        const raw = localStorage.getItem(META_KEY);
+
+        if (!raw) {
+            return null;
+        }
+
+        const meta = JSON.parse(raw);
+
+        if (
+            !meta ||
+            typeof meta !== "object" ||
+            !meta.salt ||
+            !meta.check1 ||
+            !meta.check2 ||
+            !meta.wrapped ||
+            !meta.wrappedRecovery
+        ) {
+            return null;
+        }
+
+        return meta;
+    } catch {
+        return null;
+    }
 }
 
-async function deriveKey(password, salt) {
-  const material = await crypto.subtle.importKey(
-    "raw", encode(password), "PBKDF2", false, ["deriveKey"]
-  );
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: ITERATIONS, hash: "SHA-256" },
-    material, { name: "AES-GCM", length: 256 }, false, ["encrypt","decrypt"]
-  );
+function saveMeta(meta) {
+    localStorage.setItem(META_KEY, JSON.stringify(meta));
 }
 
-async function verifier(password, salt, label) {
-  const material = await crypto.subtle.importKey(
-    "raw", encode(password), "PBKDF2", false, ["deriveBits"]
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: encode(label + ":" + salt), iterations: ITERATIONS, hash: "SHA-256" },
-    material, 256
-  );
-  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,"0")).join("");
+function secureEnvironmentAvailable() {
+    return Boolean(
+        window.isSecureContext &&
+        window.crypto &&
+        window.crypto.subtle &&
+        window.indexedDB
+    );
 }
 
-function openDB() {
-  return new Promise((resolve,reject) => {
-    const r = indexedDB.open(DB,1);
-    r.onupgradeneeded = () => {
-      if (!r.result.objectStoreNames.contains(STORE)) {
-        r.result.createObjectStore(STORE,{keyPath:"id"});
-      }
-    };
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
+
+/* =====================================================
+   PASSWORD KEY DERIVATION
+===================================================== */
+
+async function deriveWrappingKey(password, salt) {
+    const material = await crypto.subtle.importKey(
+        "raw",
+        encode(password),
+        "PBKDF2",
+        false,
+        ["deriveKey"]
+    );
+
+    return crypto.subtle.deriveKey(
+        {
+            name: "PBKDF2",
+            salt,
+            iterations: ITERATIONS,
+            hash: "SHA-256"
+        },
+        material,
+        {
+            name: "AES-GCM",
+            length: 256
+        },
+        false,
+        ["encrypt", "decrypt"]
+    );
+}
+
+async function createVerifier(password, salt, label) {
+    const material = await crypto.subtle.importKey(
+        "raw",
+        encode(password),
+        "PBKDF2",
+        false,
+        ["deriveBits"]
+    );
+
+    const bits = await crypto.subtle.deriveBits(
+        {
+            name: "PBKDF2",
+            salt: encode(label + ":" + salt),
+            iterations: ITERATIONS,
+            hash: "SHA-256"
+        },
+        material,
+        256
+    );
+
+    return Array.from(new Uint8Array(bits))
+        .map(byte => byte.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+
+/* =====================================================
+   DATABASE
+===================================================== */
+
+function openDatabase() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 1);
+
+        request.onupgradeneeded = () => {
+            const db = request.result;
+
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, {
+                    keyPath: "id"
+                });
+            }
+        };
+
+        request.onsuccess = () => resolve(request.result);
+
+        request.onerror = () => {
+            reject(request.error || new Error("Database open failed."));
+        };
+    });
 }
 
 async function dbPut(item) {
-  const db = await openDB();
-  return new Promise((resolve,reject) => {
-    const tx = db.transaction(STORE,"readwrite");
-    tx.objectStore(STORE).put(item);
-    tx.oncomplete = () => { db.close(); resolve(); };
-    tx.onerror = () => { db.close(); reject(tx.error); };
-  });
+    const db = await openDatabase();
+
+    try {
+        await new Promise((resolve, reject) => {
+            const transaction = db.transaction(
+                STORE_NAME,
+                "readwrite"
+            );
+
+            transaction.objectStore(STORE_NAME).put(item);
+
+            transaction.oncomplete = resolve;
+
+            transaction.onerror = () => {
+                reject(transaction.error);
+            };
+
+            transaction.onabort = () => {
+                reject(transaction.error || new Error("Write aborted."));
+            };
+        });
+    } finally {
+        db.close();
+    }
 }
 
-async function dbAll() {
-  const db = await openDB();
-  return new Promise((resolve,reject) => {
-    const tx = db.transaction(STORE,"readonly");
-    const r = tx.objectStore(STORE).getAll();
-    r.onsuccess = () => { db.close(); resolve(r.result); };
-    r.onerror = () => { db.close(); reject(r.error); };
-  });
+async function dbGetAll() {
+    const db = await openDatabase();
+
+    try {
+        return await new Promise((resolve, reject) => {
+            const transaction = db.transaction(
+                STORE_NAME,
+                "readonly"
+            );
+
+            const request = transaction
+                .objectStore(STORE_NAME)
+                .getAll();
+
+            request.onsuccess = () => resolve(request.result);
+
+            request.onerror = () => {
+                reject(request.error);
+            };
+        });
+    } finally {
+        db.close();
+    }
 }
 
 async function dbDelete(ids) {
-  const db = await openDB();
-  return new Promise((resolve,reject) => {
-    const tx = db.transaction(STORE,"readwrite");
-    const store = tx.objectStore(STORE);
-    ids.forEach(id => store.delete(id));
-    tx.oncomplete = () => { db.close(); resolve(); };
-    tx.onerror = () => { db.close(); reject(tx.error); };
-  });
+    const db = await openDatabase();
+
+    try {
+        await new Promise((resolve, reject) => {
+            const transaction = db.transaction(
+                STORE_NAME,
+                "readwrite"
+            );
+
+            const store = transaction.objectStore(STORE_NAME);
+
+            for (const id of ids) {
+                store.delete(id);
+            }
+
+            transaction.oncomplete = resolve;
+
+            transaction.onerror = () => {
+                reject(transaction.error);
+            };
+
+            transaction.onabort = () => {
+                reject(transaction.error || new Error("Delete aborted."));
+            };
+        });
+    } finally {
+        db.close();
+    }
 }
 
-async function wrapKey(key, raw) {
-  const iv = randomBytes(12);
-  const cipher = await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, raw);
-  return { iv: toBase64(iv), data: toBase64(new Uint8Array(cipher)) };
-}
 
-async function unwrapKey(key, wrapped) {
-  const raw = await crypto.subtle.decrypt(
-    { name:"AES-GCM", iv: fromBase64(wrapped.iv) }, key, fromBase64(wrapped.data)
-  );
-  return crypto.subtle.importKey("raw", raw, {name:"AES-GCM"}, false, ["encrypt","decrypt"]);
-}
+/* =====================================================
+   AES-GCM ENCRYPTION
+===================================================== */
 
-function saveFailures(m) {
-  m.failures1 = failures1;
-  m.failures2 = failures2;
-  m.lockUntil = lockUntil;
-  metaSave(m);
-}
+async function encryptBytes(key, bytes) {
+    const iv = randomBytes(12);
 
-function init() {
-  const m = metaGet();
-  if (!m) { show("setup"); return; }
-  failures1 = m.failures1 || 0;
-  failures2 = m.failures2 || 0;
-  lockUntil = m.lockUntil || 0;
-  if (m.recoveryRequired) { show("recovery"); } 
-  else { show("step1"); }
-}
+    const encrypted = await crypto.subtle.encrypt(
+        {
+            name: "AES-GCM",
+            iv
+        },
+        key,
+        bytes
+    );
 
-$("createBtn").onclick = async () => {
-  const p1 = $("new1").value;
-  const p2 = $("new2").value;
-  if (p1.length < 10 || p2.length < 10) {
-    $("setupStatus").textContent = "Both passwords must be at least 10 characters long.";
-    return;
-  }
-  if (p1 === p2) {
-    $("setupStatus").textContent = "Both passwords must be different.";
-    return;
-  }
-  $("createBtn").disabled = true;
-  try {
-    const salt = toBase64(randomBytes(16));
-    const raw = randomBytes(32);
-    const wrapping = await deriveKey(p1 + "\u0000" + p2, fromBase64(salt));
-    const recovery = toBase64(randomBytes(32));
-    const recoveryKey = await deriveKey(recovery, fromBase64(salt));
-
-    const m = {
-      salt, iterations: ITERATIONS,
-      check1: await verifier(p1,salt,"first"),
-      check2: await verifier(p2,salt,"second"),
-      wrapped: await wrapKey(wrapping,raw),
-      wrappedRecovery: await wrapKey(recoveryKey,raw),
-      recoveryCheck: await verifier(recovery,salt,"recovery"),
-      failures1: 0, failures2: 0, lockUntil: 0, recoveryRequired: false
+    return {
+        iv: toBase64(iv),
+        data: toBase64(new Uint8Array(encrypted))
     };
-    metaSave(m);
-    recoveryCode = recovery;
-    $("recoveryCode").textContent = recovery;
-    $("new1").value = ""; $("new2").value = "";
-    show("recoveryShow");
-  } catch(e) {
-    $("setupStatus").textContent = "Failed to create vault. Check HTTPS connection.";
-  } finally {
-    $("createBtn").disabled = false;
-  }
-};
-
-$("continueBtn").onclick = () => {
-  recoveryCode = null;
-  show("step1");
-};
-
-function locked() { return Date.now() < lockUntil; }
-
-function failure(stage) {
-  if (stage === 1) failures1++; else failures2++;
-  const m = metaGet();
-  const count = stage === 1 ? failures1 : failures2;
-  const status = stage === 1 ? "status1" : "status2";
-
-  if (count >= MAX_FAILURES) {
-    m.recoveryRequired = true;
-    saveFailures(m);
-    vaultKey = null; firstPassword = null;
-    show("recovery");
-    $("recoveryStatus").textContent = "10 failed attempts. Recovery code required.";
-    return;
-  }
-  if (count % 3 === 0) {
-    lockUntil = Date.now() + LOCK_MS;
-    saveFailures(m);
-    $(status).textContent = "Three failed attempts. Wait 60 seconds.";
-  } else {
-    saveFailures(m);
-    $(status).textContent = `Wrong password. ${MAX_FAILURES-count} attempts left.`;
-  }
 }
 
-$("step1Btn").onclick = async () => {
-  if (locked()) {
-    $("status1").textContent = `Locked. Wait ${Math.ceil((lockUntil-Date.now())/1000)} seconds.`;
-    return;
-  }
-  const p = $("pass1").value;
-  if (!p) return;
-  const m = metaGet();
-  const hash = await verifier(p,m.salt,"first");
-  if (hash !== m.check1) { $("pass1").value = ""; failure(1); return; }
-  failures1 = 0; firstPassword = p;
-  $("pass1").value = ""; $("status1").textContent = "";
-  show("step2");
-};
+async function decryptBytes(key, record) {
+    return crypto.subtle.decrypt(
+        {
+            name: "AES-GCM",
+            iv: fromBase64(record.iv)
+        },
+        key,
+        fromBase64(record.data)
+    );
+}
 
-$("step2Btn").onclick = async () => {
-  if (locked()) {
-    $("status2").textContent = `Locked. Wait ${Math.ceil((lockUntil-Date.now())/1000)} seconds.`;
-    return;
-  }
-  if (!firstPassword) { show("step1"); return; }
-  const p = $("pass2").value;
-  if (!p) return;
-  const m = metaGet();
-  const hash = await verifier(p,m.salt,"second");
-  if (hash !== m.check2) { firstPassword = null; $("pass2").value = ""; failure(2); return; }
-  
-  const wrapping = await deriveKey(firstPassword + "\u0000" + p, fromBase64(m.salt));
-  vaultKey = await unwrapKey(wrapping,m.wrapped);
-  
-  firstPassword = null; $("pass2").value = "";
-  failures1 = 0; failures2 = 0; lockUntil = 0;
-  saveFailures(m);
-  await renderGallery();
-  show("gallery");
-  startIdle();
-};
+async function importVaultKey(rawKey) {
+    return crypto.subtle.importKey(
+        "raw",
+        rawKey,
+        {
+            name: "AES-GCM"
+        },
+        false,
+        ["encrypt", "decrypt"]
+    );
+}
 
-$("recoverBtn").onclick = async () => {
-  const code = $("recoveryInput").value.trim();
-  const m = metaGet();
-  try {
-    const check = await verifier(code,m.salt,"recovery");
-    if (check !== m.recoveryCheck) { $("recoveryStatus").textContent = "Invalid recovery code."; return; }
-    const recoveryKey = await deriveKey(code, fromBase64(m.salt));
-    vaultKey = await unwrapKey(recoveryKey, m.wrappedRecovery);
-    failures1 = 0; failures2 = 0; lockUntil = 0;
-    m.recoveryRequired = false;
-    saveFailures(m);
-    await renderGallery();
-    show("gallery");
-    startIdle();
-  } catch(e) {
-    $("recoveryStatus").textContent = "Recovery failed. Check the code.";
-  }
-};
+async function wrapRawKey(wrappingKey, rawKey) {
+    return encryptBytes(wrappingKey, rawKey);
+}
+
+async function unwrapRawKey(wrappingKey, wrapped) {
+    const rawKey = await decryptBytes(wrappingKey, wrapped);
+
+    return importVaultKey(rawKey);
+}
+
+
+/* =====================================================
+   COUNTDOWN AND LOCKOUT
+===================================================== */
+
+function getRemainingSeconds(stage) {
+    return Math.max(
+        0,
+        Math.ceil((lockUntil[stage] - Date.now()) / 1000)
+    );
+}
+
+function getStageElements(stage) {
+    if (stage === "step1") {
+        return {
+            button: "step1Btn",
+            status: "status1",
+            timer: "timer1"
+        };
+    }
+
+    return {
+        button: "step2Btn",
+        status: "status2",
+        timer: "timer2"
+    };
+}
+
+function refreshCountdown() {
+    for (const stage of ["step1", "step2"]) {
+        const elements = getStageElements(stage);
+        const remaining = getRemainingSeconds(stage);
+
+        const button = $(elements.button);
+
+        if (button) {
+            button.disabled = remaining > 0;
+        }
+
+        setStatus(
+            elements.timer,
+            remaining > 0
+                ? `Locked. Try again in ${remaining} seconds.`
+                : ""
+        );
+
+        if (remaining === 0 && lockUntil[stage] !== 0) {
+            lockUntil[stage] = 0;
+            saveFailureState();
+        }
+    }
+
+    if (
+        getRemainingSeconds("step1") === 0 &&
+        getRemainingSeconds("step2") === 0
+    ) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+    }
+}
+
+function startCountdown() {
+    if (countdownTimer) {
+        clearInterval(countdownTimer);
+    }
+
+    refreshCountdown();
+
+    countdownTimer = setInterval(
+        refreshCountdown,
+        250
+    );
+}
+
+function saveFailureState() {
+    const meta = getMeta();
+
+    if (!meta) {
+        return;
+    }
+
+    meta.failures = {
+        step1: failureCounts.step1,
+        step2: failureCounts.step2
+    };
+
+    meta.lockUntil = {
+        step1: lockUntil.step1,
+        step2: lockUntil.step2
+    };
+
+    saveMeta(meta);
+}
+
+function loadFailureState(meta) {
+    failureCounts = {
+        step1: Number(meta.failures?.step1) || 0,
+        step2: Number(meta.failures?.step2) || 0
+    };
+
+    lockUntil = {
+        step1: Number(meta.lockUntil?.step1) || 0,
+        step2: Number(meta.lockUntil?.step2) || 0
+    };
+}
+
+function resetFailures() {
+    failureCounts = {
+        step1: 0,
+        step2: 0
+    };
+
+    lockUntil = {
+        step1: 0,
+        step2: 0
+    };
+
+    saveFailureState();
+}
+
+function enterRecoveryMode() {
+    const meta = getMeta();
+
+    if (!meta) {
+        return;
+    }
+
+    meta.recoveryRequired = true;
+
+    saveMeta(meta);
+
+    vaultKey = null;
+    firstPassword = null;
+
+    stopIdleTimer();
+    clearGalleryURLs();
+
+    $("grid").replaceChildren();
+
+    showScreen("recovery");
+
+    setStatus(
+        "recoveryStatus",
+        "Too many failed attempts. Enter your recovery code."
+    );
+}
+
+function registerFailure(stage) {
+    failureCounts[stage]++;
+
+    const count = failureCounts[stage];
+    const elements = getStageElements(stage);
+
+    if (count >= MAX_FAILURES) {
+        saveFailureState();
+        enterRecoveryMode();
+        return;
+    }
+
+    if (count % LOCK_EVERY === 0) {
+        lockUntil[stage] = Date.now() + LOCK_MS;
+
+        setStatus(
+            elements.status,
+            "Too many failed attempts."
+        );
+
+        saveFailureState();
+        startCountdown();
+
+        return;
+    }
+
+    setStatus(
+        elements.status,
+        `Incorrect password. ${MAX_FAILURES - count} attempts remain before recovery mode.`
+    );
+
+    saveFailureState();
+}
+
+
+/* =====================================================
+   VAULT SETUP
+===================================================== */
+
+async function createVault() {
+    if (busy) {
+        return;
+    }
+
+    if (!secureEnvironmentAvailable()) {
+        setStatus(
+            "setupStatus",
+            "A secure HTTPS connection and a modern browser are required."
+        );
+
+        return;
+    }
+
+    const password1 = $("new1").value;
+    const password2 = $("new2").value;
+
+    if (password1.length < 12 || password2.length < 12) {
+        setStatus(
+            "setupStatus",
+            "Both passwords must contain at least 12 characters."
+        );
+
+        return;
+    }
+
+    if (password1 === password2) {
+        setStatus(
+            "setupStatus",
+            "Choose two different passwords."
+        );
+
+        return;
+    }
+
+    if (getMeta()) {
+        setStatus(
+            "setupStatus",
+            "A vault already exists in this browser. Do not overwrite it."
+        );
+
+        return;
+    }
+
+    busy = true;
+    $("createBtn").disabled = true;
+
+    try {
+        const saltBytes = randomBytes(16);
+        const salt = toBase64(saltBytes);
+
+        const rawVaultKey = randomBytes(32);
+        const vaultWrappingKey = await deriveWrappingKey(
+            password1 + "\u0000" + password2,
+            saltBytes
+        );
+
+        const recoveryBytes = randomBytes(32);
+        const recoveryCode = toBase64(recoveryBytes);
+
+        const recoveryWrappingKey = await deriveWrappingKey(
+            recoveryCode,
+            saltBytes
+        );
+
+        const wrapped = await wrapRawKey(
+            vaultWrappingKey,
+            rawVaultKey
+        );
+
+        const wrappedRecovery = await wrapRawKey(
+            recoveryWrappingKey,
+            rawVaultKey
+        );
+
+        const meta = {
+            version: 2,
+            salt,
+            iterations: ITERATIONS,
+
+            check1: await createVerifier(
+                password1,
+                salt,
+                "first"
+            ),
+
+            check2: await createVerifier(
+                password2,
+                salt,
+                "second"
+            ),
+
+            wrapped,
+            wrappedRecovery,
+
+            recoveryCheck: await createVerifier(
+                recoveryCode,
+                salt,
+                "recovery"
+            ),
+
+            failures: {
+                step1: 0,
+                step2: 0
+            },
+
+            lockUntil: {
+                step1: 0,
+                step2: 0
+            },
+
+            recoveryRequired: false
+        };
+
+        saveMeta(meta);
+
+        $("recoveryCode").textContent = recoveryCode;
+
+        $("new1").value = "";
+        $("new2").value = "";
+
+        setStatus(
+            "setupStatus",
+            ""
+        );
+
+        showScreen("recoveryShow");
+
+    } catch (error) {
+        console.error("Vault setup failed:", error);
+
+        setStatus(
+            "setupStatus",
+            "Vault creation failed. Check browser support and storage availability."
+        );
+    } finally {
+        busy = false;
+        $("createBtn").disabled = false;
+    }
+}
+
+
+/* =====================================================
+   PASSWORD VERIFICATION
+===================================================== */
+
+async function verifyFirstPassword() {
+    if (busy || getRemainingSeconds("step1") > 0) {
+        return;
+    }
+
+    const password = $("pass1").value;
+
+    if (!password) {
+        return;
+    }
+
+    const meta = getMeta();
+
+    if (!meta || meta.recoveryRequired) {
+        showScreen(meta ? "recovery" : "setup");
+        return;
+    }
+
+    busy = true;
+    $("step1Btn").disabled = true;
+
+    try {
+        const candidate = await createVerifier(
+            password,
+            meta.salt,
+            "first"
+        );
+
+        if (!equalStrings(candidate, meta.check1)) {
+            $("pass1").value = "";
+
+            registerFailure("step1");
+
+            return;
+        }
+
+        firstPassword = password;
+        $("pass1").value = "";
+
+        setStatus("status1", "");
+        setStatus("timer1", "");
+
+        showScreen("step2");
+
+        startCountdown();
+
+    } catch (error) {
+        console.error("First verification failed:", error);
+
+        setStatus(
+            "status1",
+            "Verification failed. Please try again."
+        );
+    } finally {
+        busy = false;
+
+        if (getRemainingSeconds("step1") === 0) {
+            $("step1Btn").disabled = false;
+        }
+    }
+}
+
+async function verifySecondPassword() {
+    if (busy || getRemainingSeconds("step2") > 0) {
+        return;
+    }
+
+    if (!firstPassword) {
+        showScreen("step1");
+        return;
+    }
+
+    const password = $("pass2").value;
+
+    if (!password) {
+        return;
+    }
+
+    const meta = getMeta();
+
+    if (!meta || meta.recoveryRequired) {
+        firstPassword = null;
+        showScreen(meta ? "recovery" : "setup");
+        return;
+    }
+
+    busy = true;
+    $("step2Btn").disabled = true;
+
+    try {
+        const candidate = await createVerifier(
+            password,
+            meta.salt,
+            "second"
+        );
+
+        if (!equalStrings(candidate, meta.check2)) {
+            $("pass2").value = "";
+            firstPassword = null;
+
+            registerFailure("step2");
+
+            return;
+        }
+
+        const wrappingKey = await deriveWrappingKey(
+            firstPassword + "\u0000" + password,
+            fromBase64(meta.salt)
+        );
+
+        vaultKey = await unwrapRawKey(
+            wrappingKey,
+            meta.wrapped
+        );
+
+        firstPassword = null;
+        $("pass2").value = "";
+
+        resetFailures();
+
+        setStatus("status2", "");
+        setStatus("timer2", "");
+
+        await renderGallery();
+
+        showScreen("gallery");
+
+        startIdleTimer();
+
+    } catch (error) {
+        console.error("Second verification failed:", error);
+
+        vaultKey = null;
+        firstPassword = null;
+
+        setStatus(
+            "status2",
+            "Unable to unlock the vault. Check your passwords or stored data."
+        );
+
+    } finally {
+        busy = false;
+
+        if (getRemainingSeconds("step2") === 0) {
+            $("step2Btn").disabled = false;
+        }
+    }
+}
+
+
+/* =====================================================
+   RECOVERY
+===================================================== */
+
+async function recoverVault() {
+    if (busy) {
+        return;
+    }
+
+    const code = $("recoveryInput").value.trim();
+
+    if (!code) {
+        setStatus(
+            "recoveryStatus",
+            "Enter your recovery code."
+        );
+
+        return;
+    }
+
+    const meta = getMeta();
+
+    if (!meta) {
+        setStatus(
+            "recoveryStatus",
+            "Vault metadata is missing."
+        );
+
+        return;
+    }
+
+    busy = true;
+    $("recoverBtn").disabled = true;
+
+    try {
+        const candidate = await createVerifier(
+            code,
+            meta.salt,
+            "recovery"
+        );
+
+        if (!equalStrings(candidate, meta.recoveryCheck)) {
+            setStatus(
+                "recoveryStatus",
+                "Invalid recovery code."
+            );
+
+            return;
+        }
+
+        const recoveryKey = await deriveWrappingKey(
+            code,
+            fromBase64(meta.salt)
+        );
+
+        vaultKey = await unwrapRawKey(
+            recoveryKey,
+            meta.wrappedRecovery
+        );
+
+        firstPassword = null;
+
+        $("recoveryInput").value = "";
+
+        meta.recoveryRequired = false;
+
+        resetFailures();
+
+        saveMeta(meta);
+
+        await renderGallery();
+
+        showScreen("gallery");
+
+        startIdleTimer();
+
+    } catch (error) {
+        console.error("Recovery failed:", error);
+
+        vaultKey = null;
+
+        setStatus(
+            "recoveryStatus",
+            "Recovery failed. Check your recovery code and stored data."
+        );
+    } finally {
+        busy = false;
+        $("recoverBtn").disabled = false;
+    }
+}
+
+
+/* =====================================================
+   GALLERY DISPLAY
+===================================================== */
+
+function clearGalleryURLs() {
+    for (const url of urls) {
+        URL.revokeObjectURL(url);
+    }
+
+    urls = [];
+}
 
 async function renderGallery() {
-  const grid = $("grid");
-  urls.forEach(URL.revokeObjectURL); urls = [];
-  grid.innerHTML = ""; selected.clear();
-  const items = await dbAll();
-  
-  for (const item of items) {
+    if (!vaultKey) {
+        return;
+    }
+
+    const grid = $("grid");
+
+    clearGalleryURLs();
+
+    selected.clear();
+    grid.replaceChildren();
+
     try {
-      const plain = await crypto.subtle.decrypt(
-        {name:"AES-GCM",iv:fromBase64(item.iv)}, vaultKey, fromBase64(item.data)
-      );
-      const blob = new Blob([plain],{type:item.type});
-      const url = URL.createObjectURL(blob);
-      urls.push(url);
-      
-      const tile = document.createElement("div");
-      tile.className = "tile";
-      
-      let media;
-      if (item.type.startsWith("video/")) {
-        media = document.createElement("video"); media.muted = true; media.playsInline = true;
-      } else {
-        media = document.createElement("img"); media.alt = "Private photo";
-      }
-      media.src = url;
-      
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.onchange = () => {
-        if (checkbox.checked) selected.add(item.id); else selected.delete(item.id);
-      };
-      tile.append(media,checkbox); grid.append(tile);
-    } catch(e) { console.warn("Encrypted item could not be opened"); }
-  }
-  $("count").textContent = `${items.length} items`;
-  $("empty").classList.toggle("hidden",items.length > 0);
+        const items = await dbGetAll();
+
+        for (const item of items) {
+            if (!vaultKey) {
+                break;
+            }
+
+            try {
+                const plain = await decryptBytes(
+                    vaultKey,
+                    item
+                );
+
+                const blob = new Blob(
+                    [plain],
+                    {
+                        type: item.type || "application/octet-stream"
+                    }
+                );
+
+                const url = URL.createObjectURL(blob);
+
+                urls.push(url);
+
+                const tile = document.createElement("div");
+                tile.className = "tile";
+
+                let media;
+
+                if (
+                    typeof item.type === "string" &&
+                    item.type.startsWith("video/")
+                ) {
+                    media = document.createElement("video");
+
+                    media.muted = true;
+                    media.playsInline = true;
+                    media.preload = "metadata";
+
+                } else {
+                    media = document.createElement("img");
+
+                    media.alt = "Private photo";
+                    media.loading = "lazy";
+                    media.draggable = false;
+                }
+
+                media.src = url;
+
+                const checkbox = document.createElement("input");
+
+                checkbox.type = "checkbox";
+                checkbox.setAttribute(
+                    "aria-label",
+                    "Select media item"
+                );
+
+                checkbox.addEventListener("change", () => {
+                    if (checkbox.checked) {
+                        selected.add(item.id);
+                    } else {
+                        selected.delete(item.id);
+                    }
+                });
+
+                tile.append(media, checkbox);
+
+                grid.append(tile);
+
+            } catch (error) {
+                console.warn(
+                    "An encrypted media item could not be decrypted."
+                );
+            }
+        }
+
+        $("count").textContent = `${items.length} items`;
+
+        $("empty").classList.toggle(
+            "hidden",
+            items.length > 0
+        );
+
+        setStatus("galleryStatus", "");
+
+    } catch (error) {
+        console.error("Gallery loading failed:", error);
+
+        setStatus(
+            "galleryStatus",
+            "Unable to load gallery data."
+        );
+    }
 }
 
-$("addBtn").onclick = () => $("fileInput").click();
 
-$("fileInput").onchange = async e => {
-  if (!vaultKey) return;
-  for (const file of e.target.files) {
-    const iv = randomBytes(12);
-    const cipher = await crypto.subtle.encrypt({name:"AES-GCM",iv}, vaultKey, await file.arrayBuffer());
-    const id = toBase64(randomBytes(16));
-    await dbPut({
-      id, name: file.name, type: file.type || "application/octet-stream",
-      iv: toBase64(iv), data: toBase64(new Uint8Array(cipher))
-    });
-  }
-  e.target.value = "";
-  await renderGallery();
-};
+/* =====================================================
+   ADD PHOTOS AND VIDEOS
+===================================================== */
 
-$("deleteBtn").onclick = async () => {
-  if (!selected.size) { alert("Select items first."); return; }
-  if (!confirm(`Delete ${selected.size} selected items?`)) return;
-  await dbDelete([...selected]);
-  await renderGallery();
-};
+async function addFiles(event) {
+    const files = Array.from(event.target.files || []);
 
-$("shareBtn").onclick = async () => {
-  if (!selected.size) { alert("Select items first."); return; }
-  try {
-    const items = (await dbAll()).filter(item => selected.has(item.id));
-    const files = [];
-    for (const item of items) {
-      const plain = await crypto.subtle.decrypt(
-        {name:"AES-GCM",iv:fromBase64(item.iv)}, vaultKey, fromBase64(item.data)
-      );
-      files.push(new File([plain], item.name, {type:item.type}));
+    event.target.value = "";
+
+    if (!vaultKey || files.length === 0) {
+        return;
     }
-    if (navigator.share && navigator.canShare && navigator.canShare({files})) {
-      await navigator.share({files,title:"Private Gallery"});
+
+    if (busy) {
+        return;
+    }
+
+    busy = true;
+    $("addBtn").disabled = true;
+
+    try {
+        for (const file of files) {
+            if (!vaultKey) {
+                break;
+            }
+
+            if (
+                !file.type.startsWith("image/") &&
+                !file.type.startsWith("video/")
+            ) {
+                continue;
+            }
+
+            const bytes = await file.arrayBuffer();
+
+            const encrypted = await encryptBytes(
+                vaultKey,
+                bytes
+            );
+
+            const id = toBase64(randomBytes(16));
+
+            await dbPut({
+                id,
+                name: file.name,
+                type: file.type,
+                size: file.size,
+                iv: encrypted.iv,
+                data: encrypted.data
+            });
+        }
+
+        await renderGallery();
+
+        setStatus(
+            "galleryStatus",
+            "Selected media has been processed."
+        );
+
+    } catch (error) {
+        console.error("Adding media failed:", error);
+
+        setStatus(
+            "galleryStatus",
+            "Unable to add media. Check available storage."
+        );
+    } finally {
+        busy = false;
+        $("addBtn").disabled = false;
+    }
+}
+
+
+/* =====================================================
+   DELETE SELECTED MEDIA
+===================================================== */
+
+async function deleteSelected() {
+    if (!vaultKey) {
+        return;
+    }
+
+    if (selected.size === 0) {
+        alert("Select at least one item first.");
+        return;
+    }
+
+    const confirmed = confirm(
+        `Permanently delete ${selected.size} selected item(s) from this gallery?`
+    );
+
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+        await dbDelete([...selected]);
+
+        selected.clear();
+
+        await renderGallery();
+
+        setStatus(
+            "galleryStatus",
+            "Selected items deleted from the gallery database."
+        );
+
+    } catch (error) {
+        console.error("Delete failed:", error);
+
+        setStatus(
+            "galleryStatus",
+            "Unable to delete selected items."
+        );
+    }
+}
+
+
+/* =====================================================
+   SHARE SELECTED MEDIA
+===================================================== */
+
+async function shareSelected() {
+    if (!vaultKey) {
+        return;
+    }
+
+    if (selected.size === 0) {
+        alert("Select at least one item first.");
+        return;
+    }
+
+    try {
+        const items = await dbGetAll();
+
+        const chosen = items.filter(
+            item => selected.has(item.id)
+        );
+
+        const files = [];
+
+        for (const item of chosen) {
+            if (!vaultKey) {
+                return;
+            }
+
+            const plain = await decryptBytes(
+                vaultKey,
+                item
+            );
+
+            files.push(
+                new File(
+                    [plain],
+                    item.name || "private-media",
+                    {
+                        type: item.type || "application/octet-stream"
+                    }
+                )
+            );
+        }
+
+        if (
+            navigator.share &&
+            navigator.canShare &&
+            navigator.canShare({ files })
+        ) {
+            await navigator.share({
+                title: "Private Gallery",
+                files
+            });
+
+        } else {
+            alert(
+                "File sharing is not supported by this browser. Try a compatible mobile browser."
+            );
+        }
+
+    } catch (error) {
+        if (error.name !== "AbortError") {
+            console.error("Sharing failed:", error);
+
+            alert("Unable to share selected media.");
+        }
+    }
+}
+
+
+/* =====================================================
+   IDLE LOCK
+===================================================== */
+
+function stopIdleTimer() {
+    if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+    }
+}
+
+function startIdleTimer() {
+    stopIdleTimer();
+
+    if (!vaultKey) {
+        return;
+    }
+
+    idleTimer = setTimeout(() => {
+        lockVault();
+
+        alert(
+            "The vault has been locked due to inactivity."
+        );
+    }, IDLE_MS);
+}
+
+function lockVault() {
+    stopIdleTimer();
+
+    vaultKey = null;
+    firstPassword = null;
+
+    selected.clear();
+
+    clearGalleryURLs();
+
+    $("grid").replaceChildren();
+
+    $("pass1").value = "";
+    $("pass2").value = "";
+    $("recoveryInput").value = "";
+
+    init();
+}
+
+
+/* =====================================================
+   INITIALIZATION
+===================================================== */
+
+function init() {
+    if (!secureEnvironmentAvailable()) {
+        showScreen("setup");
+
+        setStatus(
+            "setupStatus",
+            "Use HTTPS on a modern browser to access secure cryptographic features."
+        );
+
+        return;
+    }
+
+    const meta = getMeta();
+
+    if (!meta) {
+        showScreen("setup");
+        return;
+    }
+
+    loadFailureState(meta);
+
+    if (meta.recoveryRequired) {
+        showScreen("recovery");
     } else {
-      alert("File sharing is not supported in this browser.");
+        showScreen("step1");
     }
-  } catch(e) {
-    if (e.name !== "AbortError") alert("Failed to share.");
-  }
-};
 
-function lockGallery() {
-  clearTimeout(idleTimer);
-  vaultKey = null; firstPassword = null;
-  urls.forEach(URL.revokeObjectURL); urls = [];
-  $("grid").innerHTML = "";
-  $("pass1").value = ""; $("pass2").value = "";
-  init();
+    startCountdown();
 }
 
-function startIdle() {
-  clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => {
-    lockGallery();
-    alert("Gallery locked due to inactivity.");
-  },60000);
-}
 
-$("lockBtn").onclick = lockGallery;
+/* =====================================================
+   EVENT HANDLERS
+===================================================== */
 
-["pointerdown","keydown","touchstart"].forEach(event => {
-  window.addEventListener(event,() => {
-    if (!$("gallery").classList.contains("hidden")) startIdle();
-  },{passive:true});
+$("createBtn").addEventListener(
+    "click",
+    createVault
+);
+
+$("continueBtn").addEventListener("click", () => {
+    showScreen("step1");
+    startCountdown();
 });
 
-document.addEventListener("visibilitychange",() => {
-  if (document.hidden && !$("gallery").classList.contains("hidden")) lockGallery();
+$("copyRecoveryBtn").addEventListener("click", async () => {
+    const code = $("recoveryCode").textContent;
+
+    try {
+        await navigator.clipboard.writeText(code);
+
+        setStatus(
+            "recoveryShowStatus",
+            "Recovery code copied. Store it securely."
+        );
+
+    } catch {
+        setStatus(
+            "recoveryShowStatus",
+            "Copy unavailable. Select and copy the recovery code manually."
+        );
+    }
 });
 
-if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js").catch(() => {});
+$("step1Btn").addEventListener(
+    "click",
+    verifyFirstPassword
+);
+
+$("step2Btn").addEventListener(
+    "click",
+    verifySecondPassword
+);
+
+$("recoverBtn").addEventListener(
+    "click",
+    recoverVault
+);
+
+$("fileInput").addEventListener(
+    "change",
+    addFiles
+);
+
+$("deleteBtn").addEventListener(
+    "click",
+    deleteSelected
+);
+
+$("shareBtn").addEventListener(
+    "click",
+    shareSelected
+);
+
+$("lockBtn").addEventListener(
+    "click",
+    lockVault
+);
+
+$("addBtn").addEventListener("click", () => {
+    if (vaultKey) {
+        $("fileInput").click();
+    }
+});
+
+
+/* =====================================================
+   ACTIVITY MONITORING
+===================================================== */
+
+function handleActivity() {
+    if (vaultKey) {
+        startIdleTimer();
+    }
 }
 
-if (!crypto.subtle || !window.indexedDB) {
-  alert("Please use a modern browser with HTTPS.");
+[
+    "pointerdown",
+    "keydown",
+    "touchstart"
+].forEach(eventName => {
+    window.addEventListener(
+        eventName,
+        handleActivity,
+        { passive: true }
+    );
+});
+
+document.addEventListener(
+    "visibilitychange",
+    () => {
+        if (document.hidden && vaultKey) {
+            lockVault();
+        }
+    }
+);
+
+
+/* =====================================================
+   SERVICE WORKER
+===================================================== */
+
+if (
+    "serviceWorker" in navigator &&
+    window.isSecureContext
+) {
+    window.addEventListener("load", () => {
+        navigator.serviceWorker
+            .register("./sw.js")
+            .catch(error => {
+                console.warn(
+                    "Service worker registration failed:",
+                    error
+                );
+            });
+    });
 }
+
+
+/* =====================================================
+   START APPLICATION
+===================================================== */
 
 init();
