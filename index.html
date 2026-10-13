@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#6a11cb">
+<title>Private Gallery</title>
+
+<link rel="manifest" href="./manifest.json">
+<link rel="stylesheet" href="./style.css">
+
+</head>
+<body>
+
+<header>🔐 Private Gallery</header>
+
+<main>
+<!-- Setup Vault -->
+<section id="setup" class="card hidden">
+  <h2>Setup Secure Vault</h2>
+  <p class="notice">
+    Create two different passwords. Keep the recovery code safe. 
+    Photos will be encrypted locally in your browser.
+  </p>
+  <input id="new1" type="password" placeholder="First Password">
+  <input id="new2" type="password" placeholder="Second Password">
+  <button id="createBtn">Create Vault</button>
+  <p id="setupStatus" class="status"></p>
+</section>
+
+<!-- Recovery Code Display -->
+<section id="recoveryShow" class="card hidden">
+  <h2>Save Your Recovery Code</h2>
+  <p>
+    Save this code in a secure place. If you lose this code, recovering your data might be impossible.
+  </p>
+  <p id="recoveryCode" class="notice" style="word-break: break-all; font-weight: bold; color: #d63031;"></p>
+  <button id="continueBtn">I have saved the code</button>
+</section>
+
+<!-- Step 1 Verification -->
+<section id="step1" class="card hidden">
+  <h2>Security Check — 1/2</h2>
+  <input id="pass1" type="password" placeholder="First Password">
+  <button id="step1Btn">Continue</button>
+  <p id="status1" class="status"></p>
+</section>
+
+<!-- Step 2 Verification -->
+<section id="step2" class="card hidden">
+  <h2>Security Check — 2/2</h2>
+  <input id="pass2" type="password" placeholder="Second Password">
+  <button id="step2Btn">Open Gallery</button>
+  <p id="status2" class="status"></p>
+</section>
+
+<!-- Recovery Login -->
+<section id="recovery" class="card hidden">
+  <h2>Recovery Access</h2>
+  <p class="notice">
+    After 10 failed attempts, the gallery enters recovery mode. Photos are not deleted automatically.
+  </p>
+  <input id="recoveryInput" type="password" placeholder="Recovery Code">
+  <button id="recoverBtn">Recover</button>
+  <p id="recoveryStatus" class="status"></p>
+</section>
+
+<!-- Main Gallery -->
+<section id="gallery" class="hidden">
+  <div class="card">
+    <h2>My Private Gallery</h2>
+    <p id="count">0 items</p>
+    <button id="addBtn">＋ Add Photos</button>
+    <input id="fileInput" type="file" accept="image/*,video/*" multiple class="hidden">
+    <button id="lockBtn" class="secondary">🔒 Lock Vault</button>
+  </div>
+
+  <div class="toolbar">
+    <button id="shareBtn" class="secondary">↗ Share</button>
+    <button id="deleteBtn" class="danger">🗑 Delete</button>
+  </div>
+
+  <div id="grid" class="grid"></div>
+  <p id="empty" class="notice">No photos yet.</p>
+</section>
+</main>
+
+<footer>
+  Private Gallery · Local encrypted storage
+</footer>
+
+<script src="./app.js"></script>
+</body>
+</html>
