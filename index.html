@@ -19,9 +19,11 @@
 </head>
 <body>
 
-<header>🔐 Private Gallery</header>
+<header class="topbar">
+  <h1>🔐 Private Gallery</h1>
+</header>
 
-<main>
+<main class="container">
 <!-- Setup Vault -->
 <section id="setup" class="card hidden">
   <h2>Setup Secure Vault</h2>
@@ -41,7 +43,7 @@
   <p>
     Save this code in a secure place. If you lose this code, recovering your data might be impossible.
   </p>
-  <p id="recoveryCode" class="notice" style="word-break: break-all; font-weight: bold; color: #d63031;"></p>
+  <p id="recoveryCode" class="recovery-code"></p>
   <button id="copyRecoveryBtn">Copy Code</button>
   <button id="continueBtn">I have saved the code</button>
   <p id="recoveryShowStatus" class="status"></p>
@@ -53,7 +55,7 @@
   <input id="pass1" type="password" placeholder="First Password">
   <button id="step1Btn">Continue</button>
   <p id="status1" class="status"></p>
-  <p id="timer1" class="status"></p>
+  <p id="timer1" class="status timer"></p>
 </section>
 
 <!-- Step 2 Verification -->
@@ -62,7 +64,7 @@
   <input id="pass2" type="password" placeholder="Second Password">
   <button id="step2Btn">Open Gallery</button>
   <p id="status2" class="status"></p>
-  <p id="timer2" class="status"></p>
+  <p id="timer2" class="status timer"></p>
 </section>
 
 <!-- Recovery Login -->
