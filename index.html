@@ -1,4 +1,4 @@
-!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -42,7 +42,9 @@
     Save this code in a secure place. If you lose this code, recovering your data might be impossible.
   </p>
   <p id="recoveryCode" class="notice" style="word-break: break-all; font-weight: bold; color: #d63031;"></p>
+  <button id="copyRecoveryBtn">Copy Code</button>
   <button id="continueBtn">I have saved the code</button>
+  <p id="recoveryShowStatus" class="status"></p>
 </section>
 
 <!-- Step 1 Verification -->
@@ -51,6 +53,7 @@
   <input id="pass1" type="password" placeholder="First Password">
   <button id="step1Btn">Continue</button>
   <p id="status1" class="status"></p>
+  <p id="timer1" class="status"></p>
 </section>
 
 <!-- Step 2 Verification -->
@@ -59,6 +62,7 @@
   <input id="pass2" type="password" placeholder="Second Password">
   <button id="step2Btn">Open Gallery</button>
   <p id="status2" class="status"></p>
+  <p id="timer2" class="status"></p>
 </section>
 
 <!-- Recovery Login -->
@@ -80,6 +84,7 @@
     <button id="addBtn">＋ Add Photos</button>
     <input id="fileInput" type="file" accept="image/*,video/*" multiple class="hidden">
     <button id="lockBtn" class="secondary">🔒 Lock Vault</button>
+    <p id="galleryStatus" class="status"></p>
   </div>
 
   <div class="toolbar">
