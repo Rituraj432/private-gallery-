@@ -1036,6 +1036,10 @@ async function renderGallery() {
                 }
 
                 media.src = url;
+                // फोटो/वीडियो क्लिक करने पर पॉपअप खोलने का कोड
+                media.addEventListener("click", () => {
+                    openMediaModal(url, item.type);
+                });
 
                 const checkbox = document.createElement("input");
 
