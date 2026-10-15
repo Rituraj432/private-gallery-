@@ -1493,5 +1493,29 @@ if (
 /* =====================================================
    START APPLICATION
 ===================================================== */
+/* =====================================================
+   FULL SCREEN MEDIA MODAL
+===================================================== */
+function openMediaModal(url, type) {
+    $("mediaModal").classList.remove("hidden");
+    
+    if (typeof type === "string" && type.startsWith("video/")) {
+        $("modalVideo").src = url;
+        $("modalVideo").classList.remove("hidden");
+        $("modalImage").classList.add("hidden");
+        $("modalVideo").play();
+    } else {
+        $("modalImage").src = url;
+        $("modalImage").classList.remove("hidden");
+        $("modalVideo").classList.add("hidden");
+    }
+}
+
+$("closeModal").addEventListener("click", () => {
+    $("mediaModal").classList.add("hidden");
+    $("modalVideo").pause();
+    $("modalVideo").src = "";
+    $("modalImage").src = "";
+});
 
 init();
