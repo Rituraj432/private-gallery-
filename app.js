@@ -1521,5 +1521,28 @@ $("closeModal").addEventListener("click", () => {
     $("modalVideo").src = "";
     $("modalImage").src = "";
 });
+/* =====================================================
+   DISABLE PASTE ON ALL INPUTS (PASSWORDS & RECOVERY)
+===================================================== */
+const inputConfigs = [
+    { id: "new1", status: "setupStatus" },
+    { id: "new2", status: "setupStatus" },
+    { id: "pass1", status: "status1" },
+    { id: "pass2", status: "status2" },
+    { id: "recoveryInput", status: "recoveryStatus" }
+];
+
+inputConfigs.forEach(item => {
+    const input = $(item.id);
+    if (input) {
+        input.addEventListener("paste", (event) => {
+            event.preventDefault(); // पेस्ट को पूरी तरह रोक दो
+            setStatus(
+                item.status,
+                "Copy-paste is disabled for security. Please type manually."
+            );
+        });
+    }
+});
 
 init();
