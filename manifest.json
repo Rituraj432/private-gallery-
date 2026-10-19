@@ -3,7 +3,7 @@
   "short_name": "Vault",
   "start_url": "./index.html",
   "display": "standalone",
-  "background_color": "#e0c3fc",
+  "background_color": "#101218",
   "theme_color": "#6a11cb",
   "icons": [
     {
